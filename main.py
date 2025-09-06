@@ -275,3 +275,54 @@ def predict(req: PredictRequest):
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
+
+class PredictRawRequest(BaseModel):
+    model_url: str
+    records: List[dict]   # e.g. [{"total_bill":20.5,"size":2,"sex":"Male","smoker":"No","day":"Sat","time":"Dinner"}]
+
+@app.post("/predict_raw")
+def predict_raw(req: PredictRawRequest):
+    try:
+        # cache model
+        if req.model_url not in _model_cache:
+            r = requests.get(req.model_url, timeout=60)
+            r.raise_for_status()
+            _model_cache[req.model_url] = joblib.load(io.BytesIO(r.content))
+        model = _model_cache[req.model_url]
+
+        df = pd.DataFrame(req.records)
+
+        # minimal preprocessing mirroring training
+        for c in df.columns:
+            if pd.api.types.is_numeric_dtype(df[c]):
+                df[c] = df[c].fillna(0)
+            else:
+                df[c] = df[c].astype(str).fillna("")
+
+        # one-hot like training (drop_first=True)
+        df = pd.get_dummies(df, drop_first=True)
+
+        # align to model’s training feature order
+        features = getattr(model, "feature_names_in_", None)
+        if features is not None:
+            for col in features:
+                if col not in df.columns:
+                    df[col] = 0
+            df = df[[c for c in features]]
+
+        yhat = model.predict(df)
+        out = {"predictions": yhat.tolist()}
+
+        # include proba if classification
+        try:
+            task = "classification" if hasattr(model, "predict_proba") else "regression"
+            if task == "classification":
+                out["proba"] = model.predict_proba(df).tolist()
+        except Exception:
+            pass
+
+        return out
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
