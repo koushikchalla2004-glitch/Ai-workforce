@@ -326,3 +326,68 @@ def predict_raw(req: PredictRawRequest):
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
+class PredictBulkReq(BaseModel):
+    model_url: str
+    records: List[dict]   # raw fields, e.g. sex="Male" etc.
+
+@app.post("/predict_bulk")
+def predict_bulk(req: PredictBulkReq):
+    try:
+        if req.model_url not in _model_cache:
+            r = requests.get(req.model_url, timeout=60)
+            r.raise_for_status()
+            _model_cache[req.model_url] = joblib.load(io.BytesIO(r.content))
+        model = _model_cache[req.model_url]
+
+        df = pd.DataFrame(req.records)
+        # minimal preprocessing
+        for c in df.columns:
+            if pd.api.types.is_numeric_dtype(df[c]):
+                df[c] = df[c].fillna(0)
+            else:
+                df[c] = df[c].astype(str).fillna("")
+        df = pd.get_dummies(df, drop_first=True)
+        # align to training features
+        features = getattr(model, "feature_names_in_", None)
+        if features is not None:
+            for col in features:
+                if col not in df.columns:
+                    df[col] = 0
+            df = df[[c for c in features]]
+
+        yhat = model.predict(df)
+        out = {"predictions": yhat.tolist()}
+        if hasattr(model, "predict_proba"):
+            try:
+                out["proba"] = model.predict_proba(df).tolist()
+            except Exception:
+                pass
+        return out
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+class TrainChunkedReq(BaseModel):
+    dataset_url: str
+    target: Optional[str] = None
+    task: Optional[str] = "auto"
+    chunksize: Optional[int] = 200000
+
+@app.post("/train_chunked")
+def train_chunked(req: TrainChunkedReq):
+    try:
+        # stream chunks
+        r = requests.get(req.dataset_url, stream=True, timeout=120)
+        r.raise_for_status()
+        # write to temp file (stream to disk, not RAM)
+        tmp = io.BytesIO(r.content)   # simple MVP; for huge files, write to a NamedTemporaryFile
+        # fallback: use pandas with chunksize (note: BytesIO doesn't support chunksize parsing cleanly)
+        # In production, prefer a temporary file then pd.read_csv(tmp_path, chunksize=req.chunksize)
+
+        # For the MVP, you can keep train() but document that very large files should be used with
+        # external processing (DuckDB or Polars). We'll keep this route as a placeholder.
+        raise HTTPException(status_code=400, detail="For >200MB use scheduled training with DuckDB/Polars service.")
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
