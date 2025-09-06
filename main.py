@@ -187,9 +187,11 @@ def train(req: TrainRequest):
             for name, m in models:
                 m.fit(X_train, y_train)
                 y_pred = m.predict(X_test)
+                mse = mean_squared_error(y_test, y_pred)     # some sklearn builds don’t support 'squared'
+                rmse = float(np.sqrt(mse))
                 r2 = r2_score(y_test, y_pred)
-                rmse = mean_squared_error(y_test, y_pred, squared=False)
                 mae = mean_absolute_error(y_test, y_pred)
+
                 results.append((name, m, {"r2": r2, "rmse": rmse, "mae": mae}))
             # pick best by r2
             best = max(results, key=lambda t: t[2]["r2"])
