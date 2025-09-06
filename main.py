@@ -1,47 +1,82 @@
+# FastAPI worker for AI Workforce
+# Endpoints:
+# - /health           : quick alive check
+# - /eda              : quick EDA with simple charts (base64 HTML)
+# - /train            : baseline training (regression/classification)
+# - /predict          : expects already-encoded feature columns; auto-aligns to training features
+# - /predict_raw      : accepts natural fields, does same preprocessing as training (get_dummies drop_first)
+# - /predict_bulk     : micro-batch version of /predict_raw for real-time
 
-# FastAPI worker + predictor for AI Workforce
-# Endpoints: /eda, /train, /predict
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
+from typing import List, Optional, Dict, Any
 import pandas as pd
 import numpy as np
 import io, base64, json, os, requests, traceback
-from typing import List, Optional, Dict, Any
 
 from sklearn.model_selection import train_test_split
 from sklearn.linear_model import LogisticRegression, LinearRegression
 from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
-from sklearn.metrics import accuracy_score, f1_score, r2_score, mean_absolute_error, mean_squared_error
+from sklearn.metrics import (
+    accuracy_score, f1_score, r2_score,
+    mean_absolute_error, mean_squared_error,
+)
 import joblib
+
 import matplotlib
-matplotlib.use("Agg")
+matplotlib.use("Agg")  # headless
 import matplotlib.pyplot as plt
 
-app = FastAPI(title="AI Workforce Worker")
+app = FastAPI(title="AI Workforce Worker", version="1.1.0")
 
+# ---------------------------
+# Helpers
+# ---------------------------
 def df_from_url(url: str) -> pd.DataFrame:
-    r = requests.get(url, timeout=60)
+    r = requests.get(url, timeout=120)
     r.raise_for_status()
     data = r.content
-    # try csv
+    # Try CSV
     try:
-        df = pd.read_csv(io.BytesIO(data))
-        return df
+        return pd.read_csv(io.BytesIO(data))
     except Exception:
         pass
-    # try excel
+    # Try Excel
     try:
-        df = pd.read_excel(io.BytesIO(data))
-        return df
+        return pd.read_excel(io.BytesIO(data))
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Unsupported file/parse error: {e}")
 
-def chart_to_b64():
+def chart_to_b64() -> str:
     buf = io.BytesIO()
     plt.savefig(buf, format="png", bbox_inches="tight")
     plt.close()
     return base64.b64encode(buf.getvalue()).decode("utf-8")
 
+def preprocess_like_training(df: pd.DataFrame) -> pd.DataFrame:
+    """Mimic the minimal preprocessing used in /train: fill NA and one-hot with drop_first."""
+    df = df.copy()
+    for c in df.columns:
+        if pd.api.types.is_numeric_dtype(df[c]):
+            df[c] = df[c].fillna(0)
+        else:
+            df[c] = df[c].astype(str).fillna("")
+    df = pd.get_dummies(df, drop_first=True)
+    return df
+
+def align_to_features(df: pd.DataFrame, model) -> pd.DataFrame:
+    """Add missing feature columns as 0, drop extras, and order to model.feature_names_in_ if present."""
+    features = getattr(model, "feature_names_in_", None)
+    if features is None:
+        return df
+    for col in features:
+        if col not in df.columns:
+            df[col] = 0
+    return df[[c for c in features]]
+
+# ---------------------------
+# Models & Schemas
+# ---------------------------
 class EDARequest(BaseModel):
     dataset_url: str
 
@@ -50,46 +85,76 @@ class EDAResponse(BaseModel):
     eda_html_b64: str
     inferred: Dict[str, Any]
 
+class TrainRequest(BaseModel):
+    dataset_url: str
+    target: Optional[str] = None
+    task: Optional[str] = "auto"  # 'auto' | 'classification' | 'regression'
+
+class TrainResponse(BaseModel):
+    metrics_json: Dict[str, Any]
+    predictions_csv_b64: str
+    model_pkl_b64: str
+    model_card_md_b64: str
+    chosen_model: str
+
+class PredictRequest(BaseModel):
+    model_url: str
+    records: List[dict]  # already encoded OR we will just align
+
+class PredictResponse(BaseModel):
+    predictions: List[float]
+
+class PredictRawRequest(BaseModel):
+    model_url: str
+    records: List[dict]  # natural fields; we will preprocess + one-hot
+
+class PredictBulkReq(BaseModel):
+    model_url: str
+    records: List[dict]  # natural fields; micro-batch
+
+_model_cache = {}
+
+# ---------------------------
+# Health
+# ---------------------------
+@app.get("/health")
+def health():
+    return {"ok": True, "version": "1.1.0"}
+
+# ---------------------------
+# EDA
+# ---------------------------
 @app.post("/eda", response_model=EDAResponse)
 def eda(req: EDARequest):
     try:
         df = df_from_url(req.dataset_url)
         rows, cols = df.shape
-        summary = {
-            "rows": rows,
-            "cols": cols,
-            "columns": []
-        }
-        # simple dtype/nulls/unique
+        summary = {"rows": rows, "cols": cols, "columns": []}
         for c in df.columns:
             col = df[c]
             summary["columns"].append({
                 "name": c,
                 "dtype": str(col.dtype),
                 "nulls": int(col.isna().sum()),
-                "unique": int(col.nunique())
+                "unique": int(col.nunique()),
             })
 
-        # infer target candidate: last column with low unique count for classification else last column numeric for regression
-        inferred_task = None
-        inferred_target = None
+        # naive target inference: discrete for classification else last numeric for regression
+        inferred_task, inferred_target = None, None
         for c in reversed(df.columns.tolist()):
             nun = df[c].nunique(dropna=True)
-            if nun <= max(10, int(0.05*rows)):
-                inferred_task = "classification"
-                inferred_target = c
+            if nun <= max(10, int(0.05 * max(rows, 1))):
+                inferred_task, inferred_target = "classification", c
                 break
         if inferred_task is None:
             for c in reversed(df.columns.tolist()):
                 if pd.api.types.is_numeric_dtype(df[c]):
-                    inferred_task = "regression"
-                    inferred_target = c
+                    inferred_task, inferred_target = "regression", c
                     break
         if inferred_task is None:
-            inferred_task = "regression"
-            inferred_target = df.columns[-1]
+            inferred_task, inferred_target = "regression", df.columns[-1]
 
-        # basic plots (up to 4)
+        # simple plots (up to 4)
         html_parts = [f"<h2>EDA Report</h2><p>Rows: {rows} | Cols: {cols}</p>"]
         plotted = 0
         for c in df.columns[:4]:
@@ -111,65 +176,52 @@ def eda(req: EDARequest):
 
         eda_html = "\n".join(html_parts)
         eda_html_b64 = base64.b64encode(eda_html.encode("utf-8")).decode("utf-8")
-
-        eda_json = summary
-        inferred = {"task": inferred_task, "target": inferred_target}
-        return {"eda_json": eda_json, "eda_html_b64": eda_html_b64, "inferred": inferred}
+        return {
+            "eda_json": summary,
+            "eda_html_b64": eda_html_b64,
+            "inferred": {"task": inferred_task, "target": inferred_target},
+        }
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
-class TrainRequest(BaseModel):
-    dataset_url: str
-    target: Optional[str] = None
-    task: Optional[str] = "auto"
-
-class TrainResponse(BaseModel):
-    metrics_json: Dict[str, Any]
-    predictions_csv_b64: str
-    model_pkl_b64: str
-    model_card_md_b64: str
-    chosen_model: str
-
+# ---------------------------
+# Train
+# ---------------------------
 @app.post("/train", response_model=TrainResponse)
 def train(req: TrainRequest):
     try:
         df = df_from_url(req.dataset_url).copy()
-        if req.target is None:
-            # naive inference: choose last column
-            target = df.columns[-1]
-        else:
-            target = req.target
-
+        target = req.target or df.columns[-1]
         y = df[target]
         X = df.drop(columns=[target])
 
-        # minimal preprocessing: drop rows with NA in target, fillna 0 for numeric, mode for categorical
+        # minimal preprocessing
         mask = y.notna()
         X, y = X[mask], y[mask]
-
         for c in X.columns:
             if pd.api.types.is_numeric_dtype(X[c]):
                 X[c] = X[c].fillna(0)
             else:
                 X[c] = X[c].astype(str).fillna("")
-        # one-hot encode categoricals
         X = pd.get_dummies(X, drop_first=True)
 
         # infer task
         task = req.task
         if task == "auto":
-            task = "classification" if (y.nunique() <= max(10, int(0.05*len(y)))) else "regression"
+            task = "classification" if (y.nunique() <= max(10, int(0.05 * len(y)))) else "regression"
 
-        # train/test split
-        stratify = y if (task=="classification" and y.nunique()>1) else None
-        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=stratify)
+        # split
+        stratify = y if (task == "classification" and y.nunique() > 1) else None
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=0.2, random_state=42, stratify=stratify
+        )
 
         results = []
         if task == "classification":
             models = [
                 ("logreg", LogisticRegression(max_iter=1000)),
-                ("rf", RandomForestClassifier(n_estimators=200, random_state=42))
+                ("rf", RandomForestClassifier(n_estimators=200, random_state=42)),
             ]
             for name, m in models:
                 m.fit(X_train, y_train)
@@ -177,23 +229,20 @@ def train(req: TrainRequest):
                 acc = accuracy_score(y_test, y_pred)
                 f1 = f1_score(y_test, y_pred, average="weighted")
                 results.append((name, m, {"accuracy": acc, "f1": f1}))
-            # pick best by f1
             best = max(results, key=lambda t: t[2]["f1"])
         else:
             models = [
                 ("linreg", LinearRegression()),
-                ("rf", RandomForestRegressor(n_estimators=300, random_state=42))
+                ("rf", RandomForestRegressor(n_estimators=300, random_state=42)),
             ]
             for name, m in models:
                 m.fit(X_train, y_train)
                 y_pred = m.predict(X_test)
-                mse = mean_squared_error(y_test, y_pred)     # some sklearn builds don’t support 'squared'
+                mse = mean_squared_error(y_test, y_pred)   # no 'squared' kw for older builds
                 rmse = float(np.sqrt(mse))
                 r2 = r2_score(y_test, y_pred)
                 mae = mean_absolute_error(y_test, y_pred)
-
                 results.append((name, m, {"r2": r2, "rmse": rmse, "mae": mae}))
-            # pick best by r2
             best = max(results, key=lambda t: t[2]["r2"])
 
         best_name, best_model, best_metrics = best
@@ -201,8 +250,7 @@ def train(req: TrainRequest):
         # predictions for test set
         y_pred = best_model.predict(X_test)
         preds = pd.DataFrame({"y_true": y_test, "y_pred": y_pred})
-        preds_csv = preds.to_csv(index=False).encode("utf-8")
-        predictions_csv_b64 = base64.b64encode(preds_csv).decode("utf-8")
+        predictions_csv_b64 = base64.b64encode(preds.to_csv(index=False).encode("utf-8")).decode("utf-8")
 
         # serialize model
         buf = io.BytesIO()
@@ -219,71 +267,51 @@ Metrics:
 {json.dumps(best_metrics, indent=2)}
 
 Notes:
-- Minimal preprocessing + one-hot encoding.
-- Baselines only for speed; consider tuning later.
-- Do not use for high-stakes decisions without validation.
+- Minimal preprocessing + one-hot (drop_first=True).
+- Baselines for speed; consider tuning/feature engineering later.
+- Not for high-stakes use without validation.
 """
         model_card_md_b64 = base64.b64encode(card.encode("utf-8")).decode("utf-8")
 
-        # include task/target in metrics
         metrics_json = {"task": task, "target": target, "chosen_model": best_name, "metrics": best_metrics}
-
         return {
             "metrics_json": metrics_json,
             "predictions_csv_b64": predictions_csv_b64,
             "model_pkl_b64": model_pkl_b64,
             "model_card_md_b64": model_card_md_b64,
-            "chosen_model": best_name
+            "chosen_model": best_name,
         }
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
-        
-class PredictRequest(BaseModel):
-    model_url: str
-    records: List[dict]
 
-class PredictResponse(BaseModel):
-    predictions: List[float]
-
-_model_cache = {}
-
+# ---------------------------
+# Predict (expects already-encoded columns; we still align order)
+# ---------------------------
 @app.post("/predict", response_model=PredictResponse)
 def predict(req: PredictRequest):
     try:
-        # cache models by URL
         if req.model_url not in _model_cache:
             r = requests.get(req.model_url, timeout=60)
             r.raise_for_status()
             _model_cache[req.model_url] = joblib.load(io.BytesIO(r.content))
         model = _model_cache[req.model_url]
 
-        # create dataframe from request
         df = pd.DataFrame(req.records)
-
-        # align to training features if available
-        features = getattr(model, "feature_names_in_", None)
-        if features is not None:
-            for col in features:
-                if col not in df.columns:
-                    df[col] = 0
-            df = df[[c for c in features]]
+        df = align_to_features(df, model)
 
         yhat = model.predict(df)
         return {"predictions": yhat.tolist()}
-
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
-class PredictRawRequest(BaseModel):
-    model_url: str
-    records: List[dict]   # e.g. [{"total_bill":20.5,"size":2,"sex":"Male","smoker":"No","day":"Sat","time":"Dinner"}]
-
+# ---------------------------
+# Predict RAW (natural fields; we preprocess + one-hot like training)
+# ---------------------------
 @app.post("/predict_raw")
 def predict_raw(req: PredictRawRequest):
     try:
-        # cache model
         if req.model_url not in _model_cache:
             r = requests.get(req.model_url, timeout=60)
             r.raise_for_status()
@@ -291,45 +319,25 @@ def predict_raw(req: PredictRawRequest):
         model = _model_cache[req.model_url]
 
         df = pd.DataFrame(req.records)
-
-        # minimal preprocessing mirroring training
-        for c in df.columns:
-            if pd.api.types.is_numeric_dtype(df[c]):
-                df[c] = df[c].fillna(0)
-            else:
-                df[c] = df[c].astype(str).fillna("")
-
-        # one-hot like training (drop_first=True)
-        df = pd.get_dummies(df, drop_first=True)
-
-        # align to model’s training feature order
-        features = getattr(model, "feature_names_in_", None)
-        if features is not None:
-            for col in features:
-                if col not in df.columns:
-                    df[col] = 0
-            df = df[[c for c in features]]
+        df = preprocess_like_training(df)
+        df = align_to_features(df, model)
 
         yhat = model.predict(df)
         out = {"predictions": yhat.tolist()}
-
-        # include proba if classification
+        # include proba if available (classification)
         try:
-            task = "classification" if hasattr(model, "predict_proba") else "regression"
-            if task == "classification":
+            if hasattr(model, "predict_proba"):
                 out["proba"] = model.predict_proba(df).tolist()
         except Exception:
             pass
-
         return out
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
-class PredictBulkReq(BaseModel):
-    model_url: str
-    records: List[dict]   # raw fields, e.g. sex="Male" etc.
-
+# ---------------------------
+# Predict BULK (micro-batch real-time; same as RAW but many records)
+# ---------------------------
 @app.post("/predict_bulk")
 def predict_bulk(req: PredictBulkReq):
     try:
@@ -340,54 +348,17 @@ def predict_bulk(req: PredictBulkReq):
         model = _model_cache[req.model_url]
 
         df = pd.DataFrame(req.records)
-        # minimal preprocessing
-        for c in df.columns:
-            if pd.api.types.is_numeric_dtype(df[c]):
-                df[c] = df[c].fillna(0)
-            else:
-                df[c] = df[c].astype(str).fillna("")
-        df = pd.get_dummies(df, drop_first=True)
-        # align to training features
-        features = getattr(model, "feature_names_in_", None)
-        if features is not None:
-            for col in features:
-                if col not in df.columns:
-                    df[col] = 0
-            df = df[[c for c in features]]
+        df = preprocess_like_training(df)
+        df = align_to_features(df, model)
 
         yhat = model.predict(df)
         out = {"predictions": yhat.tolist()}
-        if hasattr(model, "predict_proba"):
-            try:
+        try:
+            if hasattr(model, "predict_proba"):
                 out["proba"] = model.predict_proba(df).tolist()
-            except Exception:
-                pass
+        except Exception:
+            pass
         return out
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
-class TrainChunkedReq(BaseModel):
-    dataset_url: str
-    target: Optional[str] = None
-    task: Optional[str] = "auto"
-    chunksize: Optional[int] = 200000
-
-@app.post("/train_chunked")
-def train_chunked(req: TrainChunkedReq):
-    try:
-        # stream chunks
-        r = requests.get(req.dataset_url, stream=True, timeout=120)
-        r.raise_for_status()
-        # write to temp file (stream to disk, not RAM)
-        tmp = io.BytesIO(r.content)   # simple MVP; for huge files, write to a NamedTemporaryFile
-        # fallback: use pandas with chunksize (note: BytesIO doesn't support chunksize parsing cleanly)
-        # In production, prefer a temporary file then pd.read_csv(tmp_path, chunksize=req.chunksize)
-
-        # For the MVP, you can keep train() but document that very large files should be used with
-        # external processing (DuckDB or Polars). We'll keep this route as a placeholder.
-        raise HTTPException(status_code=400, detail="For >200MB use scheduled training with DuckDB/Polars service.")
-    except Exception as e:
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
-
-
