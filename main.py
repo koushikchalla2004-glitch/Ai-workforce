@@ -238,7 +238,7 @@ Notes:
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
-
+        
 class PredictRequest(BaseModel):
     model_url: str
     records: List[dict]
@@ -251,27 +251,26 @@ _model_cache = {}
 @app.post("/predict", response_model=PredictResponse)
 def predict(req: PredictRequest):
     try:
+        # cache models by URL
         if req.model_url not in _model_cache:
             r = requests.get(req.model_url, timeout=60)
             r.raise_for_status()
             _model_cache[req.model_url] = joblib.load(io.BytesIO(r.content))
         model = _model_cache[req.model_url]
-       df = pd.DataFrame(req.records)
 
-       # Try to align to the model's expected feature columns
-       features = getattr(model, "feature_names_in_", None)
-       if features is not None:
-           # Add any missing columns with 0, drop extras, and reorder
-           for col in features:
-               if col not in df.columns:
-                   df[col] = 0
-           df = df[[c for c in features]]
-  
-# If your training used one-hot encoding, make sure your inputs are already dummy-encoded.
-# (Later we can add a /predict_raw endpoint that performs the same preprocessing as training.)
+        # create dataframe from request
+        df = pd.DataFrame(req.records)
 
-yhat = model.predict(df)
-return {"predictions": yhat.tolist()}
+        # align to training features if available
+        features = getattr(model, "feature_names_in_", None)
+        if features is not None:
+            for col in features:
+                if col not in df.columns:
+                    df[col] = 0
+            df = df[[c for c in features]]
+
+        yhat = model.predict(df)
+        return {"predictions": yhat.tolist()}
 
     except Exception as e:
         traceback.print_exc()
