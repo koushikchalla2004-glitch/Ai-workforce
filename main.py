@@ -256,7 +256,7 @@ def predict(req: PredictRequest):
             r.raise_for_status()
             _model_cache[req.model_url] = joblib.load(io.BytesIO(r.content))
         model = _model_cache[req.model_url]
-       df = pd.DataFrame(payload.records)
+       df = pd.DataFrame(req.records)
 
        # Try to align to the model's expected feature columns
        features = getattr(model, "feature_names_in_", None)
