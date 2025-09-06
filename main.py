@@ -256,10 +256,23 @@ def predict(req: PredictRequest):
             r.raise_for_status()
             _model_cache[req.model_url] = joblib.load(io.BytesIO(r.content))
         model = _model_cache[req.model_url]
-        df = pd.DataFrame(req.records)
-        # note: expects feature engineering same as training (user should send encoded columns)
-        yhat = model.predict(df)
-        return {"predictions": yhat.tolist()}
+       df = pd.DataFrame(payload.records)
+
+       # Try to align to the model's expected feature columns
+       features = getattr(model, "feature_names_in_", None)
+       if features is not None:
+           # Add any missing columns with 0, drop extras, and reorder
+           for col in features:
+               if col not in df.columns:
+                   df[col] = 0
+           df = df[[c for c in features]]
+  
+# If your training used one-hot encoding, make sure your inputs are already dummy-encoded.
+# (Later we can add a /predict_raw endpoint that performs the same preprocessing as training.)
+
+yhat = model.predict(df)
+return {"predictions": yhat.tolist()}
+
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
